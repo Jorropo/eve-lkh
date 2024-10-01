@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -21,9 +20,6 @@ func main() {
 
 const baseUrl = "https://esi.evetech.net"
 
-var throttle = make(chan struct{}, 16)
-var wg sync.WaitGroup
-
 var client = http.Client{
 	Transport: http.DefaultTransport,
 }
@@ -33,7 +29,9 @@ func init() {
 	tpt := client.Transport.(*http.Transport).Clone()
 
 	tpt.ForceAttemptHTTP2 = false
-	tpt.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	tpt.TLSClientConfig = &tls.Config{
+		NextProtos: []string{"http/1.1"},
+	}
 	tpt.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	tpt.TLSHandshakeTimeout = 10 * time.Second
 
@@ -74,10 +72,8 @@ type stargateT struct {
 	} `json:"destination"`
 }
 
-var dataLock sync.Mutex
 var systemsIdToNames = make(map[uint32]string)
 var systemIdToDestinations = make(map[uint32]map[uint32]struct{})
-var fetchedSystems uint
 
 func run() error {
 	systems, err := getSystems()
@@ -85,96 +81,76 @@ func run() error {
 		return fmt.Errorf("failed to fetch systems: %w", err)
 	}
 
-	wg.Add(len(systems))
-	for _, system := range systems {
-		throttle <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-throttle }()
+	for i, system := range systems {
+		req, err := http.NewRequest("GET", baseUrl+"/v4/universe/systems/"+strconv.FormatUint(uint64(system), 10)+"/", nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request for system %d: %w", system, err)
+		}
 
-		trySystem:
-
-			req, err := http.NewRequest("GET", baseUrl+"/v4/universe/systems/"+strconv.FormatUint(uint64(system), 10)+"/", nil)
-			if err != nil {
-				panic(err)
-			}
-
+		var sys systemT
+		for {
 			resp, err := client.Do(req)
 			if err != nil {
-				panic(err)
+				return fmt.Errorf("failed to fetch system %d: %w", system, err)
 			}
 
 			if resp.StatusCode != http.StatusOK {
 				log.Println("got error code", resp.StatusCode, "for system", system)
 				resp.Body.Close()
 				time.Sleep(5 * time.Second)
-				goto trySystem
+				continue
 			}
 
-			var sys systemT
 			if err := json.NewDecoder(resp.Body).Decode(&sys); err != nil {
-				panic(err)
+				resp.Body.Close()
+				return fmt.Errorf("failed to decode system %d: %w", system, err)
 			}
-
 			resp.Body.Close()
-			<-throttle
+			break
+		}
 
-			if len(sys.Stargates) == 0 {
-				return
+		systemsIdToNames[system] = sys.Name
+
+		if len(sys.Stargates) == 0 {
+			continue
+		}
+
+		destinationMap := make(map[uint32]struct{})
+
+		for _, stargate := range sys.Stargates {
+			req, err := http.NewRequest("GET", baseUrl+"/v1/universe/stargates/"+strconv.FormatUint(uint64(stargate), 10)+"/", nil)
+			if err != nil {
+				return fmt.Errorf("failed to create request for stargate %d: %w", stargate, err)
 			}
 
-			destinationMap := make(map[uint32]struct{})
-			var destinationLock sync.Mutex
+			var gate stargateT
+			for {
+				resp, err := client.Do(req)
+				if err != nil {
+					return fmt.Errorf("failed to fetch stargate %d: %w", stargate, err)
+				}
 
-			wg.Add(len(sys.Stargates))
-			for _, stargate := range sys.Stargates {
-				throttle <- struct{}{}
-				go func() {
-					defer wg.Done()
-					defer func() { <-throttle }()
-
-				try:
-
-					req, err := http.NewRequest("GET", baseUrl+"/v1/universe/stargates/"+strconv.FormatUint(uint64(stargate), 10)+"/", nil)
-					if err != nil {
-						panic(err)
-					}
-
-					resp, err := client.Do(req)
-					if err != nil {
-						panic(err)
-					}
-
-					if resp.StatusCode != http.StatusOK {
-						resp.Body.Close()
-						log.Println(fmt.Sprintf("expected 200 status got %d for stargate %d", resp.StatusCode, stargate))
-						time.Sleep(5 * time.Second)
-						goto try
-					}
-
-					var gate stargateT
-					if err := json.NewDecoder(resp.Body).Decode(&gate); err != nil {
-						panic(err)
-					}
-
+				if resp.StatusCode != http.StatusOK {
+					log.Println(fmt.Sprintf("expected 200 status got %d for stargate %d", resp.StatusCode, stargate))
 					resp.Body.Close()
+					time.Sleep(5 * time.Second)
+					continue
+				}
 
-					destinationLock.Lock()
-					defer destinationLock.Unlock()
-					destinationMap[gate.Destination.SystemID] = struct{}{}
-				}()
+				if err := json.NewDecoder(resp.Body).Decode(&gate); err != nil {
+					resp.Body.Close()
+					return fmt.Errorf("failed to decode stargate %d: %w", stargate, err)
+				}
+				resp.Body.Close()
+				break
 			}
 
-			dataLock.Lock()
-			defer dataLock.Unlock()
-			systemsIdToNames[system] = sys.Name
-			systemIdToDestinations[system] = destinationMap
-			fetchedSystems++
-			log.Println(fetchedSystems)
-		}()
-	}
+			destinationMap[gate.Destination.SystemID] = struct{}{}
+		}
 
-	wg.Wait()
+		systemIdToDestinations[system] = destinationMap
+		log.Println(i+1, "of", len(systems))
+	}
 
 	if err := json.NewEncoder(os.Stdout).Encode(struct {
 		Systems map[uint32]string
