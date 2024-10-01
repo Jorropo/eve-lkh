@@ -1,14 +1,9 @@
 package main
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
-	"strconv"
-	"time"
 )
 
 func main() {
@@ -18,149 +13,85 @@ func main() {
 	}
 }
 
-const baseUrl = "https://esi.evetech.net"
+const JitaID = 30000142
 
-var client = http.Client{
-	Transport: http.DefaultTransport,
+type graph struct {
+	Nodes map[uint32]struct {
+		Name     string  `json:"name"`
+		Security float64 `json:"security"`
+		Region   string  `json:"region"`
+	} `json:"nodes"`
+	Edges []lk `json:"edges"`
 }
 
-func init() {
-	// disable HTTP2
-	tpt := client.Transport.(*http.Transport).Clone()
-
-	tpt.ForceAttemptHTTP2 = false
-	tpt.TLSClientConfig = &tls.Config{
-		NextProtos: []string{"http/1.1"},
-	}
-	tpt.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	tpt.TLSHandshakeTimeout = 10 * time.Second
-
-	client.Transport = tpt
-}
-
-func getSystems() (systems []uint32, _ error) {
-	req, err := http.NewRequest("GET", baseUrl+"/v1/universe/systems/", nil)
+func loadGraph() (graph, error) {
+	f, err := os.Open("eve-map.json")
 	if err != nil {
-		return nil, err
+		return graph{}, err
+	}
+	defer f.Close()
+
+	var g graph
+	if err := json.NewDecoder(f).Decode(&g); err != nil {
+		return graph{}, err
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("expected 200 status got %d", resp.StatusCode)
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&systems); err != nil {
-		return nil, err
-	}
-
-	return systems, nil
+	return g, nil
 }
 
-type systemT struct {
-	Name      string   `json:"name"`
-	Stargates []uint32 `json:"stargates"`
+type lk struct {
+	From uint32 `json:"from"`
+	To   uint32 `json:"to"`
 }
 
-type stargateT struct {
-	Destination struct {
-		SystemID uint32 `json:"system_id"`
-	} `json:"destination"`
-}
+func markAllReachables(reachables map[uint32]struct{}, edges map[uint32][]uint32, node uint32) {
+	if _, ok := reachables[node]; ok {
+		return
+	}
+	reachables[node] = struct{}{}
 
-var systemsIdToNames = make(map[uint32]string)
-var systemIdToDestinations = make(map[uint32]map[uint32]struct{})
+	for _, next := range edges[node] {
+		markAllReachables(reachables, edges, next)
+	}
+}
 
 func run() error {
-	systems, err := getSystems()
+	g, err := loadGraph()
 	if err != nil {
-		return fmt.Errorf("failed to fetch systems: %w", err)
+		return fmt.Errorf("failed to load graph: %w", err)
 	}
 
-	for i, system := range systems {
-		req, err := http.NewRequest("GET", baseUrl+"/v4/universe/systems/"+strconv.FormatUint(uint64(system), 10)+"/", nil)
-		if err != nil {
-			return fmt.Errorf("failed to create request for system %d: %w", system, err)
-		}
+	var edges = make(map[uint32][]uint32)
+	for _, edge := range g.Edges {
+		edges[edge.From] = append(edges[edge.From], edge.To)
+	}
+	var reachAbleNodes = make(map[uint32]struct{})
+	markAllReachables(reachAbleNodes, edges, JitaID)
 
-		var sys systemT
-		for {
-			resp, err := client.Do(req)
-			if err != nil {
-				return fmt.Errorf("failed to fetch system %d: %w", system, err)
-			}
+	file, err := os.Create("graph.tsp")
+	if err != nil {
+		return fmt.Errorf("failed to create TSP file: %w", err)
+	}
+	defer file.Close()
 
-			if resp.StatusCode != http.StatusOK {
-				log.Println("got error code", resp.StatusCode, "for system", system)
-				resp.Body.Close()
-				time.Sleep(5 * time.Second)
-				continue
-			}
+	fmt.Fprintln(file, "NAME: graph")
+	fmt.Fprintln(file, "TYPE: TSP")
+	fmt.Fprintln(file, "EDGE_WEIGHT_TYPE: EXPLICIT")
+	fmt.Fprintln(file, "EDGE_WEIGHT_FORMAT: EDGE_LIST")
+	fmt.Fprintf(file, "DIMENSION: %d\n", len(g.Nodes))
+	fmt.Fprintln(file, "EDGE_DATA_FORMAT: EDGE_LIST")
+	fmt.Fprintln(file, "EDGE_DATA_SECTION")
 
-			if err := json.NewDecoder(resp.Body).Decode(&sys); err != nil {
-				resp.Body.Close()
-				return fmt.Errorf("failed to decode system %d: %w", system, err)
-			}
-			resp.Body.Close()
-			break
-		}
-
-		systemsIdToNames[system] = sys.Name
-
-		if len(sys.Stargates) == 0 {
+	for _, edge := range g.Edges {
+		if _, ok := reachAbleNodes[edge.From]; !ok {
 			continue
 		}
-
-		destinationMap := make(map[uint32]struct{})
-
-		for _, stargate := range sys.Stargates {
-			req, err := http.NewRequest("GET", baseUrl+"/v1/universe/stargates/"+strconv.FormatUint(uint64(stargate), 10)+"/", nil)
-			if err != nil {
-				return fmt.Errorf("failed to create request for stargate %d: %w", stargate, err)
-			}
-
-			var gate stargateT
-			for {
-				resp, err := client.Do(req)
-				if err != nil {
-					return fmt.Errorf("failed to fetch stargate %d: %w", stargate, err)
-				}
-
-				if resp.StatusCode != http.StatusOK {
-					log.Println(fmt.Sprintf("expected 200 status got %d for stargate %d", resp.StatusCode, stargate))
-					resp.Body.Close()
-					time.Sleep(5 * time.Second)
-					continue
-				}
-
-				if err := json.NewDecoder(resp.Body).Decode(&gate); err != nil {
-					resp.Body.Close()
-					return fmt.Errorf("failed to decode stargate %d: %w", stargate, err)
-				}
-				resp.Body.Close()
-				break
-			}
-
-			destinationMap[gate.Destination.SystemID] = struct{}{}
-		}
-
-		systemIdToDestinations[system] = destinationMap
-		log.Println(i+1, "of", len(systems))
+		fmt.Fprintf(file, "%d %d 1\n", edge.From, edge.To)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(struct {
-		Systems map[uint32]string
-		Links   map[uint32]map[uint32]struct{}
-	}{
-		Systems: systemsIdToNames,
-		Links:   systemIdToDestinations,
-	}); err != nil {
-		return fmt.Errorf("failed to encode data: %w", err)
-	}
+	fmt.Fprintln(file, "-1")
+
+	fmt.Println("TSP file created successfully!")
 
 	return nil
 }

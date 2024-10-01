@@ -1,0 +1,2 @@
+PROBLEM_FILE = graph.tsp
+OUTPUT_TOUR_FILE = output.tour
