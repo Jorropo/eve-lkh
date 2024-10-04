@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"regexp"
@@ -84,6 +85,10 @@ func (d *D2) String() string {
 }
 
 func run() error {
+	var onlySearchThatRegion string
+	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
+	flag.Parse()
+
 	g, err := loadGraph()
 	if err != nil {
 		return fmt.Errorf("failed to load graph: %w", err)
@@ -155,10 +160,15 @@ func run() error {
 	}
 
 	// Now that we have the full matrix, remove all the systems we don't care about.
-	neededInComputeMatrix := make([]uint32, 0, len(reachableList)-len(visited))
+	var neededInComputeMatrix []uint32
 	for _, v := range reachableList {
 		if _, ok := visited[v]; ok {
 			continue
+		}
+		if onlySearchThatRegion != "" {
+			if g.Nodes[v].Region != onlySearchThatRegion {
+				continue
+			}
 		}
 		neededInComputeMatrix = append(neededInComputeMatrix, v)
 	}
@@ -281,7 +291,7 @@ func parseAlreadyVisitedSystems(reachable map[uint32]struct{}, g graph) (map[uin
 
 	visited := make(map[uint32]struct{})
 
-	for _, logName := range os.Args[1:] {
+	for _, logName := range flag.Args() {
 		fmt.Println("parsing:", logName)
 		if err := func() error {
 			f, err := os.Open(logName)
