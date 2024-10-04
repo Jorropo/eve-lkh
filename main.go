@@ -89,6 +89,13 @@ func run() error {
 		return fmt.Errorf("failed to load graph: %w", err)
 	}
 
+	err = loadSolution(g)
+	if err == nil {
+		return nil
+	}
+	fmt.Println("failed to load solution: ", err)
+	fmt.Println("Generating new TSP file...")
+
 	var edges = make(map[uint32][]uint32)
 
 	for _, edge := range g.Edges {
@@ -313,4 +320,69 @@ func parseAlreadyVisitedSystems(reachable map[uint32]struct{}, g graph) (map[uin
 	}
 
 	return visited, nil
+}
+
+func loadSolution(g graph) error {
+	f, err := os.Open("output.tour")
+	if err != nil {
+		return fmt.Errorf("opening solution file: %w", err)
+	}
+	defer f.Close()
+
+	var solution []uint32
+	scanner := bufio.NewScanner(bufio.NewReaderSize(f, 1024*1024*32))
+	for scanner.Scan() {
+		if string(scanner.Bytes()) == "TOUR_SECTION" {
+			goto parse
+		}
+	}
+	return fmt.Errorf("TOUR_SECTION not found")
+parse:
+	for scanner.Scan() {
+		b := scanner.Bytes()
+		if string(b) == "-1" {
+			break
+		}
+
+		matrixIndex, err := strconv.ParseUint(string(b), 10, 32)
+		if err != nil {
+			return fmt.Errorf("parsing matrix index: %w", err)
+		}
+		solution = append(solution, uint32(matrixIndex-1)) // LKH is one-indexed
+	}
+	f.Close()
+
+	// Load the matrixToSystemIds file
+	f, err = os.Open("matrixToSystemIds.json")
+	if err != nil {
+		return fmt.Errorf("opening matrixToSystemIds file: %w", err)
+	}
+	defer f.Close()
+
+	var matrixToSystemIds []uint32
+	err = json.NewDecoder(f).Decode(&matrixToSystemIds)
+	if err != nil {
+		return fmt.Errorf("decoding matrixToSystemIds: %w", err)
+	}
+
+	output, err := os.Create("output.txt")
+	if err != nil {
+		return fmt.Errorf("creating output file: %w", err)
+	}
+	defer output.Close()
+
+	w := bufio.NewWriterSize(output, 1024*1024*32)
+	for _, matrixIndex := range solution {
+		systemID := matrixToSystemIds[matrixIndex]
+		w.WriteString(g.Nodes[systemID].Name)
+		w.WriteByte('\n')
+	}
+	err = w.Flush()
+	if err != nil {
+		return fmt.Errorf("flushing: %w", err)
+	}
+
+	fmt.Println("output.txt created successfully!")
+
+	return nil
 }
