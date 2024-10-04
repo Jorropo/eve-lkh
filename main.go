@@ -11,85 +11,12 @@ import (
 	"strings"
 )
 
-const JitaID = 30000142
-
-type graph struct {
-	Nodes map[uint32]struct {
-		Name     string  `json:"name"`
-		Security float64 `json:"security"`
-		Region   string  `json:"region"`
-	} `json:"nodes"`
-	Edges []lk `json:"edges"`
-}
-
-type lk struct {
-	From uint32 `json:"from"`
-	To   uint32 `json:"to"`
-}
-
-func loadGraph() (graph, error) {
-	f, err := os.Open("eve-map.json")
-	if err != nil {
-		return graph{}, err
-	}
-	defer f.Close()
-
-	var g graph
-	if err := json.NewDecoder(f).Decode(&g); err != nil {
-		return graph{}, err
-	}
-
-	return g, nil
-}
-
-func markAllReachables(reachables map[uint32]struct{}, edges map[uint32][]uint32, node uint32) {
-	if _, ok := reachables[node]; ok {
-		return
-	}
-	reachables[node] = struct{}{}
-
-	for _, next := range edges[node] {
-		markAllReachables(reachables, edges, next)
-	}
-}
-
-type D2 struct {
-	rowSize uint
-	arr     []uint8
-}
-
-func NewD2(n uint) D2 {
-	return D2{n, make([]uint8, n*n)}
-}
-
-func (d *D2) At(i, j uint) uint8 {
-	return d.arr[i*d.rowSize+j]
-}
-
-func (d *D2) Set(i, j uint, val uint8) {
-	d.arr[i*d.rowSize+j] = val
-}
-
-func (d *D2) String() string {
-	var s strings.Builder
-	var recycled []byte
-	for i := uint(0); i < uint(d.rowSize); i++ {
-		for j := uint(0); j < uint(d.rowSize); j++ {
-			recycled = strconv.AppendUint(recycled[:0], uint64(d.At(i, j)), 10)
-			s.Write(recycled)
-			s.WriteByte('\t')
-		}
-		s.WriteByte('\n')
-	}
-	return s.String()
-}
-
 func run() error {
 	var onlySearchThatRegion string
 	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
 	flag.Parse()
 
-	g, err := loadGraph()
+	g, err := loadOrCreateMap()
 	if err != nil {
 		return fmt.Errorf("failed to load graph: %w", err)
 	}
@@ -101,67 +28,14 @@ func run() error {
 	fmt.Println("failed to load solution: ", err)
 	fmt.Println("Generating new TSP file...")
 
-	var edges = make(map[uint32][]uint32)
-
-	for _, edge := range g.Edges {
-		edges[edge.From] = append(edges[edge.From], edge.To)
-	}
-
-	var reachableNodes = make(map[uint32]struct{})
-	markAllReachables(reachableNodes, edges, JitaID)
-
-	visited, err := parseAlreadyVisitedSystems(reachableNodes, g)
+	visited, err := parseAlreadyVisitedSystems(g)
 	if err != nil {
 		return fmt.Errorf("failed to parse already visited systems: %w", err)
 	}
 
-	reachableList := make([]uint32, 0, len(reachableNodes))
-	nodeMap := make(map[uint32]uint) // Map from node ID to index in the matrix
-	for node := range reachableNodes {
-		nodeMap[node] = uint(len(reachableList))
-		reachableList = append(reachableList, node)
-	}
-
-	distances := NewD2(uint(len(reachableList)))
-	// Default to max
-	for i := range distances.arr {
-		distances.arr[i] = ^uint8(0)
-	}
-	// Setup the diagonal
-	for i := range uint(len(reachableList)) {
-		distances.Set(i, i, 0)
-	}
-	// Setup the edges
-	for from, tos := range edges {
-		fromIndex := nodeMap[from]
-		for _, to := range tos {
-			distances.Set(fromIndex, nodeMap[to], 1)
-		}
-	}
-	// Run Floyd-Warshall
-	oneRow := uint(len(reachableList))
-	total := oneRow * oneRow * oneRow
-	var done uint
-	for k := range oneRow {
-		for i := range oneRow {
-			for j := range oneRow {
-				done++
-				if done%(1<<32) == 0 {
-					fmt.Printf("Progress: %d/%d %.2f%%\n", done, total, float64(done)/float64(total)*100)
-				}
-
-				new := uint(distances.At(i, k)) + uint(distances.At(k, j))
-				if new >= uint(^uint8(0)) {
-					continue
-				}
-				distances.Set(i, j, min(distances.At(i, j), uint8(new)))
-			}
-		}
-	}
-
 	// Now that we have the full matrix, remove all the systems we don't care about.
 	var neededInComputeMatrix []uint32
-	for _, v := range reachableList {
+	for _, v := range g.MatrixIndexesToIds {
 		if _, ok := visited[v]; ok {
 			continue
 		}
@@ -175,13 +49,13 @@ func run() error {
 
 	computeMatrixIdToDistanceId := make([]uint, len(neededInComputeMatrix))
 	for i, v := range neededInComputeMatrix {
-		computeMatrixIdToDistanceId[i] = nodeMap[v]
+		computeMatrixIdToDistanceId[i] = g.IdsToMatrixIndexes[v]
 	}
 
 	compute := NewD2(uint(len(neededInComputeMatrix)))
 	for i := range uint(len(neededInComputeMatrix)) {
 		for j := range uint(len(neededInComputeMatrix)) {
-			compute.Set(i, j, distances.At(computeMatrixIdToDistanceId[i], computeMatrixIdToDistanceId[j]))
+			compute.Set(i, j, g.Matrix.At(computeMatrixIdToDistanceId[i], computeMatrixIdToDistanceId[j]))
 		}
 	}
 
@@ -234,13 +108,13 @@ func outputTspFile(distances D2) error {
 	fmt.Fprintln(w, "TYPE: TSP")
 	fmt.Fprintln(w, "EDGE_WEIGHT_TYPE: EXPLICIT")
 	fmt.Fprintln(w, "EDGE_WEIGHT_FORMAT: FULL_MATRIX")
-	fmt.Fprintf(w, "DIMENSION: %d\n", distances.rowSize)
+	fmt.Fprintf(w, "DIMENSION: %d\n", distances.RowSize)
 	fmt.Fprintln(w, "EDGE_WEIGHT_SECTION")
 
 	// Output the full matrix
 	var recycled []byte
-	for i := range distances.rowSize {
-		for j := range distances.rowSize {
+	for i := range distances.RowSize {
+		for j := range distances.RowSize {
 			if j > 0 {
 				err := w.WriteByte(' ')
 				if err != nil {
@@ -276,7 +150,7 @@ func main() {
 }
 
 // parseAlreadyVisitedSystems only output systems in the reachable set.
-func parseAlreadyVisitedSystems(reachable map[uint32]struct{}, g graph) (map[uint32]struct{}, error) {
+func parseAlreadyVisitedSystems(g graph) (map[uint32]struct{}, error) {
 	nameToID := make(map[string]uint32)
 	var names []string
 	for id, node := range g.Nodes {
@@ -311,7 +185,7 @@ func parseAlreadyVisitedSystems(reachable map[uint32]struct{}, g graph) (map[uin
 				if !ok {
 					return fmt.Errorf("unknown system: %s", matches[1])
 				}
-				if _, ok := reachable[from]; ok {
+				if _, ok := g.Reachable[from]; ok {
 					visited[from] = struct{}{}
 				}
 
@@ -319,7 +193,7 @@ func parseAlreadyVisitedSystems(reachable map[uint32]struct{}, g graph) (map[uin
 				if !ok {
 					return fmt.Errorf("unknown system: %s", matches[2])
 				}
-				if _, ok := reachable[to]; ok {
+				if _, ok := g.Reachable[to]; ok {
 					visited[to] = struct{}{}
 				}
 			}
