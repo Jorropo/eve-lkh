@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -54,18 +53,18 @@ func markAllReachables(reachables map[uint32]struct{}, edges map[uint32][]uint32
 
 type D2 struct {
 	rowSize uint
-	arr     []int8
+	arr     []uint8
 }
 
 func NewD2(n uint) D2 {
-	return D2{n, make([]int8, n*n)}
+	return D2{n, make([]uint8, n*n)}
 }
 
-func (d *D2) At(i, j uint) int8 {
+func (d *D2) At(i, j uint) uint8 {
 	return d.arr[i*d.rowSize+j]
 }
 
-func (d *D2) Set(i, j uint, val int8) {
+func (d *D2) Set(i, j uint, val uint8) {
 	d.arr[i*d.rowSize+j] = val
 }
 
@@ -81,120 +80,6 @@ func (d *D2) String() string {
 		s.WriteByte('\n')
 	}
 	return s.String()
-}
-
-type dijkstraNode struct {
-	path             []uint32
-	current, atLeast uint8
-}
-
-type visitedNode struct {
-	id    uint32
-	depth uint8
-}
-
-// negative lengthes indicate it will take at least that many jumps (positive) to reach the target
-// positive lengths indicate it will take this many jumps to reach the target
-func writeDijkstraToMatrix(edges map[uint32][]uint32, distances D2, nodeMap map[uint32]uint, start, target uint32) {
-	seen := make(map[uint32]struct{})
-	var visited []visitedNode
-	queue := []dijkstraNode{{path: []uint32{start}}}
-	targetIndex := nodeMap[target]
-	bestDirectToTarget := ^uint8(0)
-	var length uint8
-
-	for len(queue) > 0 {
-		node := queue[0]
-
-		if node.atLeast >= bestDirectToTarget {
-			length = bestDirectToTarget
-			goto write
-		}
-
-		nodeId := node.path[len(node.path)-1]
-		if nodeId == target {
-			length = node.current
-			goto write
-		}
-
-		queue = queue[1:]
-
-		if _, ok := seen[nodeId]; ok {
-			continue
-		}
-		seen[nodeId] = struct{}{}
-		visited = append(visited, visitedNode{id: nodeId, depth: node.current})
-
-		var pathNeedsCopy bool
-		for _, next := range edges[nodeId] {
-			dist := distances.At(nodeMap[next], targetIndex)
-			var nextAtLeast uint8
-			nextDist := node.current + 1
-			if dist > 0 {
-				// we exactly know how long it will be
-				bestDirectToTarget = min(bestDirectToTarget, nextDist+uint8(dist))
-				continue
-			} else {
-				// we know it will take at least this many jumps
-				nextAtLeast = max(node.atLeast, nextDist, nextDist+uint8(-dist))
-			}
-			path := node.path
-			if pathNeedsCopy {
-				path = path[:len(path):len(path)]
-			} else {
-				pathNeedsCopy = true
-			}
-			queue = append(queue, dijkstraNode{
-				path:    append(path, next),
-				current: nextDist,
-				atLeast: nextAtLeast,
-			})
-		}
-		slices.SortFunc(queue, func(a, b dijkstraNode) int {
-			if a.atLeast == b.atLeast {
-				if a.current == b.current {
-					return 0
-				}
-				if a.current < b.current {
-					return -1
-				}
-				return 1
-			}
-			if a.atLeast < b.atLeast {
-				return -1
-			}
-			return 1
-		})
-	}
-	panic("path not found")
-
-write:
-	// update all the visited
-	for _, v := range visited {
-		cur := distances.At(nodeMap[v.id], targetIndex)
-		if cur > 0 {
-			// we already know the exact length from that one
-			continue
-		}
-		newAtLeast := -int8(length - v.depth) // assume from this node it would have been perfect path to the end
-		if cur <= newAtLeast {
-			// we already know a longer path
-			continue
-		}
-		distances.Set(nodeMap[v.id], targetIndex, newAtLeast)
-	}
-	// update all the in path
-	node := queue[0]
-	for i, n := range node.path {
-		distances.Set(nodeMap[n], targetIndex, int8(length)-int8(i))
-	}
-}
-
-func abs(x int8) int8 {
-	if x < 0 {
-		return -x
-	}
-	return x
 }
 
 func run() error {
@@ -220,22 +105,39 @@ func run() error {
 	}
 
 	distances := NewD2(uint(len(reachableList)))
-	total := uint(len(distances.arr))
-	done := uint(0)
+	// Default to max
+	for i := range distances.arr {
+		distances.arr[i] = ^uint8(0)
+	}
+	// Setup the diagonal
 	for i := range uint(len(reachableList)) {
-		for j := range uint(len(reachableList)) {
-			done++
-			if done%512 == 0 {
-				fmt.Printf("%.2f%% %d\n", float64(done)/float64(total)*100, done)
-			}
-			if i == j {
-				continue
-			}
-			if distances.At(i, j) != 0 {
-				continue
-			}
+		distances.Set(i, i, 0)
+	}
+	// Setup the edges
+	for from, tos := range edges {
+		fromIndex := nodeMap[from]
+		for _, to := range tos {
+			distances.Set(fromIndex, nodeMap[to], 1)
+		}
+	}
+	// Run Floyd-Warshall
+	oneRow := uint(len(reachableList))
+	total := oneRow * oneRow * oneRow
+	var done uint
+	for k := range oneRow {
+		for i := range oneRow {
+			for j := range oneRow {
+				done++
+				if done%(1<<32) == 0 {
+					fmt.Printf("Progress: %d/%d %.2f%%\n", done, total, float64(done)/float64(total)*100)
+				}
 
-			writeDijkstraToMatrix(edges, distances, nodeMap, reachableList[i], reachableList[j])
+				new := uint(distances.At(i, k)) + uint(distances.At(k, j))
+				if new >= uint(^uint8(0)) {
+					continue
+				}
+				distances.Set(i, j, min(distances.At(i, j), uint8(new)))
+			}
 		}
 	}
 
