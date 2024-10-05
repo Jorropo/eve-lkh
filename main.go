@@ -213,7 +213,7 @@ func loadSolution(g graph) error {
 	}
 	defer f.Close()
 
-	var solution []uint32
+	var solution []uint
 	scanner := bufio.NewScanner(bufio.NewReaderSize(f, 1024*1024*32))
 	for scanner.Scan() {
 		if string(scanner.Bytes()) == "TOUR_SECTION" {
@@ -232,7 +232,7 @@ parse:
 		if err != nil {
 			return fmt.Errorf("parsing matrix index: %w", err)
 		}
-		solution = append(solution, uint32(matrixIndex-1)) // LKH is one-indexed
+		solution = append(solution, uint(matrixIndex-1)) // LKH is one-indexed
 	}
 	f.Close()
 
@@ -256,8 +256,10 @@ parse:
 	defer output.Close()
 
 	w := bufio.NewWriterSize(output, 1024*1024*32)
+	var solutionAsSystemIds []uint32
 	for _, matrixIndex := range solution {
 		systemID := matrixToSystemIds[matrixIndex]
+		solutionAsSystemIds = append(solutionAsSystemIds, systemID)
 		w.WriteString(g.Nodes[systemID].Name)
 		w.WriteByte('\n')
 	}
@@ -267,6 +269,11 @@ parse:
 	}
 
 	fmt.Println("output.txt created successfully!")
+
+	err = addWaypoints(g, solutionAsSystemIds)
+	if err != nil {
+		return fmt.Errorf("adding waypoints: %w", err)
+	}
 
 	return nil
 }
