@@ -28,7 +28,7 @@ func markAllReachables(reachables map[uint32]struct{}, edges map[uint32][]uint32
 
 type D2 struct {
 	RowSize uint
-	Arr     []uint8
+	Arr     []uint8 // using uint8 for distances since the longest are in the <~100 range and this makes the full dataset fit in the L3 cache of my CPU.
 }
 
 func NewD2(n uint) D2 {
