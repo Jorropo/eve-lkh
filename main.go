@@ -16,6 +16,8 @@ func run() error {
 	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
 	var onlyHighsec bool
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
+	var gtsp bool
+	flag.BoolVar(&gtsp, "gtsp", false, "Used colored TSP algorithm, clustering by region.")
 	flag.Parse()
 
 	g, err := loadOrCreateMap(onlyHighsec)
@@ -37,6 +39,11 @@ func run() error {
 
 	// Now that we have the full matrix, remove all the systems we don't care about.
 	var neededInComputeMatrix []uint32
+	var gtspBuckets [][]uint
+	var gtspSystemsToMatrix map[string]uint
+	if gtsp {
+		gtspSystemsToMatrix = make(map[string]uint)
+	}
 	for _, v := range g.MatrixIndexesToIds {
 		if _, ok := visited[v]; ok {
 			continue
@@ -46,7 +53,18 @@ func run() error {
 				continue
 			}
 		}
+		matrixId := uint(len(neededInComputeMatrix))
 		neededInComputeMatrix = append(neededInComputeMatrix, v)
+		if gtsp {
+			region := g.Nodes[v].Region
+			regionIndex, ok := gtspSystemsToMatrix[region]
+			if !ok {
+				regionIndex = uint(len(gtspBuckets))
+				gtspSystemsToMatrix[region] = regionIndex
+				gtspBuckets = append(gtspBuckets, nil)
+			}
+			gtspBuckets[regionIndex] = append(gtspBuckets[regionIndex], matrixId)
+		}
 	}
 
 	computeMatrixIdToDistanceId := make([]uint, len(neededInComputeMatrix))
@@ -61,7 +79,7 @@ func run() error {
 		}
 	}
 
-	err = outputTspFile(compute)
+	err = outputTspFile(compute, gtspBuckets)
 	if err != nil {
 		return fmt.Errorf("failed to output TSP file: %w", err)
 	}
@@ -97,7 +115,7 @@ func outputMatrixToSystemIdsFile(indexesToSystemIds []uint32) error {
 	return nil
 }
 
-func outputTspFile(distances D2) error {
+func outputTspFile(distances D2, gtspBuckets [][]uint) error {
 	file, err := os.Create("graph.tsp")
 	if err != nil {
 		return fmt.Errorf("creating: %w", err)
@@ -106,12 +124,21 @@ func outputTspFile(distances D2) error {
 
 	w := bufio.NewWriterSize(file, 1024*1024*32)
 
-	fmt.Fprintln(w, "NAME: graph")
-	fmt.Fprintln(w, "TYPE: TSP")
-	fmt.Fprintln(w, "EDGE_WEIGHT_TYPE: EXPLICIT")
-	fmt.Fprintln(w, "EDGE_WEIGHT_FORMAT: FULL_MATRIX")
-	fmt.Fprintf(w, "DIMENSION: %d\n", distances.RowSize)
-	fmt.Fprintln(w, "EDGE_WEIGHT_SECTION")
+	typ := "TSP"
+	if gtspBuckets != nil {
+		typ = "GTSP"
+	}
+	_, err = fmt.Fprintf(w, `NAME: graph
+TYPE: %s
+GTSP_SETS: %d
+EDGE_WEIGHT_TYPE: EXPLICIT
+EDGE_WEIGHT_FORMAT: FULL_MATRIX
+DIMENSION: %d
+EDGE_WEIGHT_SECTION
+`, typ, len(gtspBuckets), distances.RowSize)
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
 
 	// Output the full matrix
 	var recycled []byte
@@ -133,6 +160,37 @@ func outputTspFile(distances D2) error {
 		if err != nil {
 			return fmt.Errorf("writing: %w", err)
 		}
+	}
+	if gtspBuckets != nil {
+		// Output the GTSP buckets
+		_, err = w.WriteString("GTSP_SET_SECTION\n")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
+		}
+		for i, bucket := range gtspBuckets {
+			recycled = strconv.AppendUint(recycled[:0], uint64(i+1), 10) // LKH is one-indexed
+			_, err := w.Write(recycled)
+			if err != nil {
+				return fmt.Errorf("writing: %w", err)
+			}
+			for _, v := range bucket {
+				recycled = append(recycled[:0], ' ')
+				recycled = strconv.AppendUint(recycled, uint64(v+1), 10) // LKH is one-indexed
+				_, err := w.Write(recycled)
+				if err != nil {
+					return fmt.Errorf("writing: %w", err)
+				}
+			}
+			_, err = w.WriteString(" -1\n")
+			if err != nil {
+				return fmt.Errorf("writing: %w", err)
+			}
+		}
+	}
+
+	_, err = w.WriteString("EOF\n")
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
 	}
 
 	err = w.Flush()
