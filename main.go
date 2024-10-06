@@ -14,6 +14,8 @@ import (
 func run() error {
 	var onlySearchThatRegion string
 	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
+	var doNotSearchThatRegion string
+	flag.StringVar(&doNotSearchThatRegion, "skip-region", "", "Region to from search. Note, the path finder will still route through this region if it's faster.")
 	var onlyHighsec bool
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	var gtsp bool
@@ -52,6 +54,11 @@ func run() error {
 		}
 		if onlySearchThatRegion != "" {
 			if g.Nodes[v].Region != onlySearchThatRegion {
+				continue
+			}
+		}
+		if doNotSearchThatRegion != "" {
+			if g.Nodes[v].Region == doNotSearchThatRegion {
 				continue
 			}
 		}
