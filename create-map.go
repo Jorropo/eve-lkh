@@ -15,14 +15,20 @@ import (
 
 const JitaID = 30000142
 
-func markAllReachables(reachables map[uint32]struct{}, edges map[uint32][]uint32, node uint32) {
+func markAllReachables(reachables map[uint32]struct{}, systems map[uint32]system, edges map[uint32][]uint32, node uint32, onlyHighsec bool) {
+	if onlyHighsec {
+		if systems[node].SecurityStatus < 0.5 {
+			return
+		}
+	}
+
 	if _, ok := reachables[node]; ok {
 		return
 	}
 	reachables[node] = struct{}{}
 
 	for _, next := range edges[node] {
-		markAllReachables(reachables, edges, next)
+		markAllReachables(reachables, systems, edges, next, onlyHighsec)
 	}
 }
 
@@ -61,6 +67,8 @@ type systemJson struct {
 	Name            string   `json:"name"`
 	Stargates       []uint32 `json:"stargates"`
 	ConstellationID uint32   `json:"constellation_id"`
+	Stations        []uint32 `json:"stations"`
+	SecurityStatus  float32  `json:"security_status"`
 }
 
 type constellationJson struct {
@@ -78,8 +86,10 @@ type stargateJson struct {
 }
 
 type system struct {
-	Name   string
-	Region string `json:"region"`
+	Name           string
+	Region         string
+	Stations       []uint32
+	SecurityStatus float32
 }
 
 type graph struct {
@@ -93,8 +103,12 @@ type graph struct {
 
 const graphFile = "graph.json"
 
-func loadGraph() (graph, error) {
-	f, err := os.Open(graphFile)
+func loadGraph(onlyHighsec bool) (graph, error) {
+	fileName := graphFile
+	if onlyHighsec {
+		fileName = "highsec-" + graphFile
+	}
+	f, err := os.Open(fileName)
 	if err != nil {
 		return graph{}, err
 	}
@@ -148,7 +162,7 @@ func fetch(url string, v interface{}) error {
 	return nil
 }
 
-func fetchSystems() (nodes map[uint32]system, edges map[uint32][]uint32, err error) {
+func fetchSystems(onlyHighsec bool) (nodes map[uint32]system, edges map[uint32][]uint32, err error) {
 	nodes = make(map[uint32]system)
 	edges = make(map[uint32][]uint32)
 
@@ -172,6 +186,10 @@ func fetchSystems() (nodes map[uint32]system, edges map[uint32][]uint32, err err
 			if err != nil {
 				fmt.Println("failed to fetch system, will retry later", id, err)
 				failedSystems = append(failedSystems, id)
+				continue
+			}
+
+			if onlyHighsec && s.SecurityStatus < 0.5 {
 				continue
 			}
 
@@ -202,8 +220,10 @@ func fetchSystems() (nodes map[uint32]system, edges map[uint32][]uint32, err err
 			}
 
 			nodes[id] = system{
-				Name:   s.Name,
-				Region: regionName,
+				Name:           s.Name,
+				Region:         regionName,
+				Stations:       s.Stations,
+				SecurityStatus: s.SecurityStatus,
 			}
 
 			stargates := s.Stargates
@@ -228,20 +248,20 @@ func fetchSystems() (nodes map[uint32]system, edges map[uint32][]uint32, err err
 	return nodes, edges, nil
 }
 
-func loadOrCreateMap() (graph, error) {
-	g, err := loadGraph()
+func loadOrCreateMap(onlyHighsec bool) (graph, error) {
+	g, err := loadGraph(onlyHighsec)
 	if err == nil {
 		return g, nil
 	}
 	fmt.Println("failed to load graph, creating a new one")
 
-	nodes, edges, err := fetchSystems()
+	nodes, edges, err := fetchSystems(onlyHighsec)
 	if err != nil {
 		return graph{}, fmt.Errorf("fetching systems: %w", err)
 	}
 
 	reachableNodes := make(map[uint32]struct{})
-	markAllReachables(reachableNodes, edges, JitaID)
+	markAllReachables(reachableNodes, nodes, edges, JitaID, onlyHighsec)
 
 	reachableList := make([]uint32, 0, len(reachableNodes))
 	nodeMap := make(map[uint32]uint) // Map from node ID to index in the matrix
@@ -263,7 +283,12 @@ func loadOrCreateMap() (graph, error) {
 	for from, tos := range edges {
 		fromIndex := nodeMap[from]
 		for _, to := range tos {
-			distances.Set(fromIndex, nodeMap[to], 1)
+			toIndex, ok := nodeMap[to]
+			if !ok {
+				continue
+			}
+
+			distances.Set(fromIndex, toIndex, 1)
 		}
 	}
 	// Run Floyd-Warshall
@@ -296,7 +321,11 @@ func loadOrCreateMap() (graph, error) {
 		Matrix:             distances,
 	}
 
-	f, err := os.Create(graphFile)
+	fileName := graphFile
+	if onlyHighsec {
+		fileName = "highsec-" + graphFile
+	}
+	f, err := os.Create(fileName)
 	if err != nil {
 		return graph{}, fmt.Errorf("creating graph file: %w", err)
 	}

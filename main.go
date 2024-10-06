@@ -14,9 +14,11 @@ import (
 func run() error {
 	var onlySearchThatRegion string
 	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
+	var onlyHighsec bool
+	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	flag.Parse()
 
-	g, err := loadOrCreateMap()
+	g, err := loadOrCreateMap(onlyHighsec)
 	if err != nil {
 		return fmt.Errorf("failed to load graph: %w", err)
 	}
