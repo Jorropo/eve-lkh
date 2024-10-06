@@ -2,10 +2,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,21 +21,14 @@ func run() error {
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	var gtsp bool
 	flag.BoolVar(&gtsp, "gtsp", false, "Used colored TSP algorithm, clustering by region.")
-	var biggestCut bool
-	flag.BoolVar(&biggestCut, "biggest-cut", false, "Define the start position by the one giving the biggest cut.")
+	var rotateToClosestSystem bool
+	flag.BoolVar(&rotateToClosestSystem, "rotate-closest", false, "Rotate the solution to the closest system you are at.")
 	flag.Parse()
 
 	g, err := loadOrCreateMap(onlyHighsec)
 	if err != nil {
 		return fmt.Errorf("failed to load graph: %w", err)
 	}
-
-	err = loadSolution(g, biggestCut)
-	if err == nil {
-		return nil
-	}
-	fmt.Println("failed to load solution: ", err)
-	fmt.Println("Generating new TSP file...")
 
 	visited, err := parseAlreadyVisitedSystems(g)
 	if err != nil {
@@ -88,44 +82,110 @@ func run() error {
 		}
 	}
 
-	err = outputTspFile(compute, gtspBuckets)
+	if gtsp {
+		err = copyFile("graph.par", "GLKH/graph.par")
+		if err != nil {
+			return fmt.Errorf("failed to copy graph.par: %w", err)
+		}
+
+		err = outputGtspFile("GLKH/graph.tsp", compute, gtspBuckets)
+		if err != nil {
+			return fmt.Errorf("failed to output GTSP file: %w", err)
+		}
+
+		cmd := exec.Command("./GLKH", "graph.par")
+		cmd.Dir = "GLKH"
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("running GLKH: %w", err)
+		}
+
+		systemsAsMatrixIds, err := loadSolution("GLKH/output.tour", false)
+		if err != nil {
+			return fmt.Errorf("failed to load GLKH solution: %w", err)
+		}
+
+		// make a new compute matrix with the results of GLKH for HPP to improve further
+		neededInComputeMatrixNarrow := make([]uint32, len(systemsAsMatrixIds))
+		computeNarrow := NewD2(uint(len(systemsAsMatrixIds)))
+		for i, v := range systemsAsMatrixIds {
+			neededInComputeMatrixNarrow[i] = neededInComputeMatrix[v]
+			for j, v2 := range systemsAsMatrixIds {
+				computeNarrow.Set(uint(i), uint(j), compute.At(v, v2))
+			}
+		}
+		neededInComputeMatrix = neededInComputeMatrixNarrow
+		compute = computeNarrow
+	}
+
+	err = copyFile("graph.par", "LKH/graph.par")
+	if err != nil {
+		return fmt.Errorf("failed to copy graph.par: %w", err)
+	}
+
+	err = outputSopFile("LKH/graph.tsp", compute)
 	if err != nil {
 		return fmt.Errorf("failed to output TSP file: %w", err)
 	}
 
-	err = outputMatrixToSystemIdsFile(neededInComputeMatrix)
+	cmd := exec.Command("./LKH", "graph.par")
+	cmd.Dir = "LKH"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
 	if err != nil {
-		return fmt.Errorf("failed to output matrixToSystemIds file: %w", err)
+		return fmt.Errorf("running LKH: %w", err)
+	}
+
+	systemsAsMatrixIds, err := loadSolution("LKH/output.tour", true)
+	if err != nil {
+		return fmt.Errorf("failed to load GLKH solution: %w", err)
+	}
+
+	var solutionAsIds []uint32
+	for _, v := range systemsAsMatrixIds {
+		solutionAsIds = append(solutionAsIds, neededInComputeMatrix[v])
+	}
+
+	err = writeOutput(g, solutionAsIds)
+	if err != nil {
+		return fmt.Errorf("failed to write output: %w", err)
+	}
+
+	err = addWaypoints(g, solutionAsIds, rotateToClosestSystem)
+	if err != nil {
+		return fmt.Errorf("failed to add waypoints to UI: %w", err)
 	}
 
 	return nil
 }
 
-func outputMatrixToSystemIdsFile(indexesToSystemIds []uint32) error {
-	// Output the matrixToSystemIds file to convert from matrix index to system ID.
-	file, err := os.Create("matrixToSystemIds.json")
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("creating file: %w", err)
+		return fmt.Errorf("opening src file: %w", err)
 	}
-	defer file.Close()
+	defer srcFile.Close()
 
-	w := bufio.NewWriterSize(file, 1024*1024*32)
-	err = json.NewEncoder(w).Encode(indexesToSystemIds)
+	dstFile, err := os.Create(dst)
 	if err != nil {
-		return fmt.Errorf("encoding json: %w", err)
+		return fmt.Errorf("creating dst file: %w", err)
 	}
+	defer dstFile.Close()
 
-	err = w.Flush()
+	_, err = io.CopyBuffer(dstFile, srcFile, make([]byte, 1024*1024*32))
 	if err != nil {
-		return fmt.Errorf("flushing: %w", err)
+		os.Remove(dst)
+		return fmt.Errorf("copying: %w", err)
 	}
 
-	fmt.Println("matrixToSystemIds file created successfully!")
 	return nil
 }
 
-func outputTspFile(distances D2, gtspBuckets [][]uint) error {
-	file, err := os.Create("graph.tsp")
+func outputGtspFile(filepath string, distances D2, gtspBuckets [][]uint) error {
+	file, err := os.Create(filepath)
 	if err != nil {
 		return fmt.Errorf("creating: %w", err)
 	}
@@ -133,23 +193,17 @@ func outputTspFile(distances D2, gtspBuckets [][]uint) error {
 
 	w := bufio.NewWriterSize(file, 1024*1024*32)
 
-	typ := "TSP"
-	if gtspBuckets != nil {
-		typ = "GTSP"
-	}
-	_, err = fmt.Fprintf(w, `NAME: graph
-TYPE: %s
+	_, err = fmt.Fprintf(w, `TYPE: GTSP
 GTSP_SETS: %d
 EDGE_WEIGHT_TYPE: EXPLICIT
 EDGE_WEIGHT_FORMAT: FULL_MATRIX
 DIMENSION: %d
 EDGE_WEIGHT_SECTION
-`, typ, len(gtspBuckets), distances.RowSize)
+`, len(gtspBuckets), distances.RowSize)
 	if err != nil {
 		return fmt.Errorf("writing: %w", err)
 	}
 
-	// Output the full matrix
 	var recycled []byte
 	for i := range distances.RowSize {
 		for j := range distances.RowSize {
@@ -170,30 +224,28 @@ EDGE_WEIGHT_SECTION
 			return fmt.Errorf("writing: %w", err)
 		}
 	}
-	if gtspBuckets != nil {
-		// Output the GTSP buckets
-		_, err = w.WriteString("GTSP_SET_SECTION\n")
+
+	_, err = w.WriteString("GTSP_SET_SECTION\n")
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+	for i, bucket := range gtspBuckets {
+		recycled = strconv.AppendUint(recycled[:0], uint64(i+1), 10) // LKH is one-indexed
+		_, err := w.Write(recycled)
 		if err != nil {
 			return fmt.Errorf("writing: %w", err)
 		}
-		for i, bucket := range gtspBuckets {
-			recycled = strconv.AppendUint(recycled[:0], uint64(i+1), 10) // LKH is one-indexed
+		for _, v := range bucket {
+			recycled = append(recycled[:0], ' ')
+			recycled = strconv.AppendUint(recycled, uint64(v+1), 10) // LKH is one-indexed
 			_, err := w.Write(recycled)
 			if err != nil {
 				return fmt.Errorf("writing: %w", err)
 			}
-			for _, v := range bucket {
-				recycled = append(recycled[:0], ' ')
-				recycled = strconv.AppendUint(recycled, uint64(v+1), 10) // LKH is one-indexed
-				_, err := w.Write(recycled)
-				if err != nil {
-					return fmt.Errorf("writing: %w", err)
-				}
-			}
-			_, err = w.WriteString(" -1\n")
-			if err != nil {
-				return fmt.Errorf("writing: %w", err)
-			}
+		}
+		_, err = w.WriteString(" -1\n")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
 		}
 	}
 
@@ -207,7 +259,85 @@ EDGE_WEIGHT_SECTION
 		return fmt.Errorf("flushing: %w", err)
 	}
 
-	fmt.Println("TSP file created successfully!")
+	return nil
+}
+
+func outputSopFile(filepath string, distances D2) error {
+	file, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("creating: %w", err)
+	}
+	defer file.Close()
+
+	w := bufio.NewWriterSize(file, 1024*1024*32)
+
+	distanceWithFakeStartAndEnd := distances.RowSize + 2
+	_, err = fmt.Fprintf(w, `TYPE: SOP
+EDGE_WEIGHT_TYPE: EXPLICIT
+EDGE_WEIGHT_FORMAT: FULL_MATRIX
+DIMENSION: %d
+EDGE_WEIGHT_SECTION
+%d
+`, distanceWithFakeStartAndEnd, distanceWithFakeStartAndEnd)
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+
+	// Add a fake start and end node with identical distances to all other nodes.
+	// Start can go everywhere except the end.
+	for range distanceWithFakeStartAndEnd - 1 {
+		_, err = w.WriteString("0 ")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
+		}
+	}
+	_, err = w.WriteString("-1\n")
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+
+	var recycled []byte
+	for i := range distances.RowSize {
+		_, err = w.WriteString("-1 ")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
+		}
+		for j := range distances.RowSize {
+			recycled = strconv.AppendUint(recycled[:0], uint64(distances.At(i, j)), 10)
+			recycled = append(recycled, ' ')
+			_, err = w.Write(recycled)
+			if err != nil {
+				return fmt.Errorf("writing: %w", err)
+			}
+		}
+		_, err = w.WriteString("0\n")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
+		}
+	}
+
+	// End can go nowhere.
+	for range distanceWithFakeStartAndEnd - 1 {
+		_, err = w.WriteString("-1 ")
+		if err != nil {
+			return fmt.Errorf("writing: %w", err)
+		}
+	}
+	_, err = w.WriteString("0\n")
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+
+	_, err = w.WriteString("EOF\n")
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+
+	err = w.Flush()
+	if err != nil {
+		return fmt.Errorf("flushing: %w", err)
+	}
+
 	return nil
 }
 
@@ -275,21 +405,20 @@ func parseAlreadyVisitedSystems(g graph) (map[uint32]struct{}, error) {
 	return visited, nil
 }
 
-func loadSolution(g graph, biggestCut bool) error {
-	f, err := os.Open("output.tour")
+func loadSolution(filepath string, isSop bool) (solution []uint, err error) {
+	f, err := os.Open(filepath)
 	if err != nil {
-		return fmt.Errorf("opening solution file: %w", err)
+		return nil, fmt.Errorf("opening solution file: %w", err)
 	}
 	defer f.Close()
 
-	var solution []uint
 	scanner := bufio.NewScanner(bufio.NewReaderSize(f, 1024*1024*32))
 	for scanner.Scan() {
 		if string(scanner.Bytes()) == "TOUR_SECTION" {
 			goto parse
 		}
 	}
-	return fmt.Errorf("TOUR_SECTION not found")
+	return nil, fmt.Errorf("TOUR_SECTION not found")
 parse:
 	for scanner.Scan() {
 		b := scanner.Bytes()
@@ -299,38 +428,24 @@ parse:
 
 		matrixIndex, err := strconv.ParseUint(string(b), 10, 32)
 		if err != nil {
-			return fmt.Errorf("parsing matrix index: %w", err)
+			return nil, fmt.Errorf("parsing matrix index: %w", err)
 		}
-		solution = append(solution, uint(matrixIndex-1)) // LKH is one-indexed
-	}
-	f.Close()
-
-	// Load the matrixToSystemIds file
-	f, err = os.Open("matrixToSystemIds.json")
-	if err != nil {
-		return fmt.Errorf("opening matrixToSystemIds file: %w", err)
-	}
-	defer f.Close()
-
-	var matrixToSystemIds []uint32
-	err = json.NewDecoder(f).Decode(&matrixToSystemIds)
-	if err != nil {
-		return fmt.Errorf("decoding matrixToSystemIds: %w", err)
-	}
-
-	if biggestCut {
-		var bestCut uint8
-		var bestCutIndex int
-		for i, matrixIndex := range solution {
-			cut := g.Matrix.At(g.IdsToMatrixIndexes[matrixToSystemIds[matrixIndex]], g.IdsToMatrixIndexes[matrixToSystemIds[solution[(i+1)%len(solution)]]])
-			if cut > bestCut {
-				bestCut = cut
-				bestCutIndex = (i + 1) % len(solution)
-			}
+		matrixIndex-- // LKH is one-indexed
+		if isSop {
+			matrixIndex-- // SOP has a fake start node
 		}
-		solution = append(solution[bestCutIndex:], solution[:bestCutIndex]...)
+		solution = append(solution, uint(matrixIndex))
 	}
 
+	if isSop {
+		// Remove the fake start and end nodes.
+		solution = solution[1 : len(solution)-1]
+	}
+
+	return solution, nil
+}
+
+func writeOutput(g graph, solution []uint32) error {
 	output, err := os.Create("output.txt")
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
@@ -338,10 +453,7 @@ parse:
 	defer output.Close()
 
 	w := bufio.NewWriterSize(output, 1024*1024*32)
-	var solutionAsSystemIds []uint32
-	for _, matrixIndex := range solution {
-		systemID := matrixToSystemIds[matrixIndex]
-		solutionAsSystemIds = append(solutionAsSystemIds, systemID)
+	for _, systemID := range solution {
 		w.WriteString(g.Nodes[systemID].Name)
 		w.WriteByte('\n')
 	}
@@ -351,11 +463,6 @@ parse:
 	}
 
 	fmt.Println("output.txt created successfully!")
-
-	err = addWaypoints(g, solutionAsSystemIds, !biggestCut)
-	if err != nil {
-		return fmt.Errorf("adding waypoints: %w", err)
-	}
 
 	return nil
 }
