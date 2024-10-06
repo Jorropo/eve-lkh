@@ -13,10 +13,10 @@ import (
 )
 
 func run() error {
-	var onlySearchThatRegion string
-	flag.StringVar(&onlySearchThatRegion, "region", "", "Only search for systems in this region. Note, the path finder will still route through other regions if it's faster.")
-	var doNotSearchThatRegion string
-	flag.StringVar(&doNotSearchThatRegion, "skip-region", "", "Region to from search. Note, the path finder will still route through this region if it's faster.")
+	var onlySearchThesesRegions string
+	flag.StringVar(&onlySearchThesesRegions, "regions", "", "Only search for systems in theses regions, separated by commas. Note, the path finder will still route through other regions if it's faster.")
+	var doNotSearchThesesRegions string
+	flag.StringVar(&doNotSearchThesesRegions, "skip-regions", "", "Regions exclude from search, separated by commas. Note, the path finder will still route through this region if it's faster.")
 	var onlyHighsec bool
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	var gtsp bool
@@ -26,6 +26,20 @@ func run() error {
 	var onlyWithStations bool
 	flag.BoolVar(&onlyWithStations, "stations", false, "Only search for systems with stations.")
 	flag.Parse()
+	var onlyThesesRegions map[string]struct{}
+	if onlySearchThesesRegions != "" {
+		onlyThesesRegions = make(map[string]struct{})
+		for region := range strings.SplitSeq(onlySearchThesesRegions, ",") {
+			onlyThesesRegions[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
+		}
+	}
+	var doNotSearchRegions map[string]struct{}
+	if doNotSearchThesesRegions != "" {
+		doNotSearchRegions = make(map[string]struct{})
+		for region := range strings.SplitSeq(doNotSearchThesesRegions, ",") {
+			doNotSearchRegions[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
+		}
+	}
 
 	g, err := loadOrCreateMap(onlyHighsec)
 	if err != nil {
@@ -49,13 +63,13 @@ func run() error {
 			continue
 		}
 		system := g.Nodes[v]
-		if onlySearchThatRegion != "" {
-			if system.Region != onlySearchThatRegion {
+		if onlyThesesRegions != nil {
+			if _, ok := onlyThesesRegions[strings.ToLower(system.Region)]; !ok {
 				continue
 			}
 		}
-		if doNotSearchThatRegion != "" {
-			if system.Region == doNotSearchThatRegion {
+		if doNotSearchRegions != nil {
+			if _, ok := doNotSearchRegions[strings.ToLower(system.Region)]; ok {
 				continue
 			}
 		}
