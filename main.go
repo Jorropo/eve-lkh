@@ -23,6 +23,8 @@ func run() error {
 	flag.BoolVar(&gtsp, "gtsp", false, "Used colored TSP algorithm, clustering by region.")
 	var rotateToClosestSystem bool
 	flag.BoolVar(&rotateToClosestSystem, "rotate-closest", false, "Rotate the solution to the closest system you are at.")
+	var onlyWithStations bool
+	flag.BoolVar(&onlyWithStations, "stations", false, "Only search for systems with stations.")
 	flag.Parse()
 
 	g, err := loadOrCreateMap(onlyHighsec)
@@ -46,16 +48,21 @@ func run() error {
 		if _, ok := visited[v]; ok {
 			continue
 		}
+		system := g.Nodes[v]
 		if onlySearchThatRegion != "" {
-			if g.Nodes[v].Region != onlySearchThatRegion {
+			if system.Region != onlySearchThatRegion {
 				continue
 			}
 		}
 		if doNotSearchThatRegion != "" {
-			if g.Nodes[v].Region == doNotSearchThatRegion {
+			if system.Region == doNotSearchThatRegion {
 				continue
 			}
 		}
+		if onlyWithStations && len(system.Stations) == 0 {
+			continue
+		}
+
 		matrixId := uint(len(neededInComputeMatrix))
 		neededInComputeMatrix = append(neededInComputeMatrix, v)
 		if gtsp {
