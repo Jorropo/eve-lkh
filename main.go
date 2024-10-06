@@ -18,6 +18,8 @@ func run() error {
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	var gtsp bool
 	flag.BoolVar(&gtsp, "gtsp", false, "Used colored TSP algorithm, clustering by region.")
+	var biggestCut bool
+	flag.BoolVar(&biggestCut, "biggest-cut", false, "Define the start position by the one giving the biggest cut.")
 	flag.Parse()
 
 	g, err := loadOrCreateMap(onlyHighsec)
@@ -25,7 +27,7 @@ func run() error {
 		return fmt.Errorf("failed to load graph: %w", err)
 	}
 
-	err = loadSolution(g)
+	err = loadSolution(g, biggestCut)
 	if err == nil {
 		return nil
 	}
@@ -266,7 +268,7 @@ func parseAlreadyVisitedSystems(g graph) (map[uint32]struct{}, error) {
 	return visited, nil
 }
 
-func loadSolution(g graph) error {
+func loadSolution(g graph, biggestCut bool) error {
 	f, err := os.Open("output.tour")
 	if err != nil {
 		return fmt.Errorf("opening solution file: %w", err)
@@ -309,6 +311,19 @@ parse:
 		return fmt.Errorf("decoding matrixToSystemIds: %w", err)
 	}
 
+	if biggestCut {
+		var bestCut uint8
+		var bestCutIndex int
+		for i, matrixIndex := range solution {
+			cut := g.Matrix.At(g.IdsToMatrixIndexes[matrixToSystemIds[matrixIndex]], g.IdsToMatrixIndexes[matrixToSystemIds[solution[(i+1)%len(solution)]]])
+			if cut > bestCut {
+				bestCut = cut
+				bestCutIndex = (i + 1) % len(solution)
+			}
+		}
+		solution = append(solution[bestCutIndex:], solution[:bestCutIndex]...)
+	}
+
 	output, err := os.Create("output.txt")
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
@@ -330,7 +345,7 @@ parse:
 
 	fmt.Println("output.txt created successfully!")
 
-	err = addWaypoints(g, solutionAsSystemIds)
+	err = addWaypoints(g, solutionAsSystemIds, !biggestCut)
 	if err != nil {
 		return fmt.Errorf("adding waypoints: %w", err)
 	}

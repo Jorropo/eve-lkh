@@ -150,7 +150,7 @@ type jwtJson struct {
 	Sub string `json:"sub"`
 }
 
-func addWaypoints(g graph, route []uint32) error {
+func addWaypoints(g graph, route []uint32, rotateBasedOnPosition bool) error {
 	token, err := grabUserToken()
 	if err != nil {
 		return fmt.Errorf("getting user token: %w", err)
@@ -176,29 +176,31 @@ func addWaypoints(g graph, route []uint32) error {
 	}
 	fmt.Println("Character ID:", id)
 
-	// grab the user's current location
-	startLocation, err := getLocation(token, id)
-	if err != nil {
-		return fmt.Errorf("getting location: %w", err)
-	}
-	locationIndex, ok := g.IdsToMatrixIndexes[startLocation]
-	if !ok {
-		return fmt.Errorf("location not in graph")
-	}
-
-	closestRouteIndex := 0
-	closestRouteLength := ^uint8(0)
-	for i, system := range route {
-		lengthToSystem := g.Matrix.At(locationIndex, g.IdsToMatrixIndexes[system])
-		if lengthToSystem < closestRouteLength {
-			closestRouteIndex = i
-			closestRouteLength = lengthToSystem
+	if rotateBasedOnPosition {
+		// grab the user's current location
+		startLocation, err := getLocation(token, id)
+		if err != nil {
+			return fmt.Errorf("getting location: %w", err)
 		}
+		locationIndex, ok := g.IdsToMatrixIndexes[startLocation]
+		if !ok {
+			return fmt.Errorf("location not in graph")
+		}
+
+		closestRouteIndex := 0
+		closestRouteLength := ^uint8(0)
+		for i, system := range route {
+			lengthToSystem := g.Matrix.At(locationIndex, g.IdsToMatrixIndexes[system])
+			if lengthToSystem < closestRouteLength {
+				closestRouteIndex = i
+				closestRouteLength = lengthToSystem
+			}
+		}
+		route = append(route[closestRouteIndex:], route[:closestRouteIndex]...)
 	}
 
 	const minBackoff = time.Second
 	backoff := minBackoff
-	route = append(route[closestRouteIndex:], route[:closestRouteIndex]...)
 	for i, system := range route {
 		err := addWaypoint(token, system, i == 0)
 		if err != nil {
