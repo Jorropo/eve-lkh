@@ -21,8 +21,8 @@ func run() error {
 	flag.BoolVar(&onlyHighsec, "highsec", false, "Only search for systems in highsec.")
 	var gtsp bool
 	flag.BoolVar(&gtsp, "gtsp", false, "Used colored TSP algorithm, clustering by region.")
-	var rotateToClosestSystem bool
-	flag.BoolVar(&rotateToClosestSystem, "rotate-closest", false, "Rotate the solution to the closest system you are at.")
+	var countCostOfStartSystem bool
+	flag.BoolVar(&countCostOfStartSystem, "start", false, "Include the travel costs from your current system.")
 	var onlyWithStations bool
 	flag.BoolVar(&onlyWithStations, "stations", false, "Only search for systems with stations.")
 	flag.Parse()
@@ -130,15 +130,41 @@ func run() error {
 
 		// make a new compute matrix with the results of GLKH for HPP to improve further
 		neededInComputeMatrixNarrow := make([]uint32, len(systemsAsMatrixIds))
+		computeMatrixIdToDistanceIdNarrow := make([]uint, len(systemsAsMatrixIds))
 		computeNarrow := NewD2(uint(len(systemsAsMatrixIds)))
 		for i, v := range systemsAsMatrixIds {
 			neededInComputeMatrixNarrow[i] = neededInComputeMatrix[v]
+			computeMatrixIdToDistanceIdNarrow[i] = computeMatrixIdToDistanceId[v]
 			for j, v2 := range systemsAsMatrixIds {
 				computeNarrow.Set(uint(i), uint(j), compute.At(v, v2))
 			}
 		}
 		neededInComputeMatrix = neededInComputeMatrixNarrow
+		computeMatrixIdToDistanceId = computeMatrixIdToDistanceIdNarrow
 		compute = computeNarrow
+	}
+
+	var token string
+	var firstHopCosts []uint8
+	if countCostOfStartSystem {
+		var userId uint32
+		token, userId, err = grabUserToken()
+		if err != nil {
+			return fmt.Errorf("failed to grab user token: %w", err)
+		}
+		startSystem, err := getLocation(token, userId)
+		if err != nil {
+			return fmt.Errorf("failed to get location: %w", err)
+		}
+		startSystemMatrixIndex, ok := g.IdsToMatrixIndexes[startSystem]
+		if !ok {
+			return fmt.Errorf("start system %d not in matrix", startSystem)
+		}
+
+		firstHopCosts = make([]uint8, len(computeMatrixIdToDistanceId))
+		for i, v := range computeMatrixIdToDistanceId {
+			firstHopCosts[i] = uint8(g.Matrix.At(startSystemMatrixIndex, v))
+		}
 	}
 
 	err = copyFile("graph.par", "LKH/graph.par")
@@ -146,7 +172,7 @@ func run() error {
 		return fmt.Errorf("failed to copy graph.par: %w", err)
 	}
 
-	err = outputSopFile("LKH/graph.tsp", compute)
+	err = outputSopFile("LKH/graph.tsp", compute, firstHopCosts)
 	if err != nil {
 		return fmt.Errorf("failed to output TSP file: %w", err)
 	}
@@ -175,7 +201,14 @@ func run() error {
 		return fmt.Errorf("failed to write output: %w", err)
 	}
 
-	err = addWaypoints(g, solutionAsIds, rotateToClosestSystem)
+	if token == "" {
+		token, _, err = grabUserToken()
+		if err != nil {
+			return fmt.Errorf("failed to grab user token: %w", err)
+		}
+	}
+
+	err = addWaypoints(g, token, solutionAsIds)
 	if err != nil {
 		return fmt.Errorf("failed to add waypoints to UI: %w", err)
 	}
@@ -283,7 +316,7 @@ EDGE_WEIGHT_SECTION
 	return nil
 }
 
-func outputSopFile(filepath string, distances D2) error {
+func outputSopFile(filepath string, distances D2, firstHopCosts []uint8) error {
 	file, err := os.Create(filepath)
 	if err != nil {
 		return fmt.Errorf("creating: %w", err)
@@ -304,20 +337,27 @@ EDGE_WEIGHT_SECTION
 		return fmt.Errorf("writing: %w", err)
 	}
 
-	// Add a fake start and end node with identical distances to all other nodes.
-	// Start can go everywhere except the end.
-	for range distanceWithFakeStartAndEnd - 1 {
-		_, err = w.WriteString("0 ")
+	var recycled []byte
+	if firstHopCosts == nil {
+		firstHopCosts = make([]uint8, distances.RowSize) // we allow the searcher to begin wherever it wants
+	}
+	_, err = w.WriteString("0 ") // zeroth's diagonal
+	if err != nil {
+		return fmt.Errorf("writing: %w", err)
+	}
+	for _, v := range firstHopCosts {
+		recycled = strconv.AppendUint(recycled[:0], uint64(v), 10)
+		recycled = append(recycled, ' ')
+		_, err = w.Write(recycled)
 		if err != nil {
 			return fmt.Errorf("writing: %w", err)
 		}
 	}
-	_, err = w.WriteString("-1\n")
+	_, err = w.WriteString("-1\n") // can't skip the whole thing straight to the end
 	if err != nil {
 		return fmt.Errorf("writing: %w", err)
 	}
 
-	var recycled []byte
 	for i := range distances.RowSize {
 		_, err = w.WriteString("-1 ")
 		if err != nil {

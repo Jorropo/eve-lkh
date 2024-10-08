@@ -29,10 +29,10 @@ type ssoResponseJson struct {
 	AccessToken string `json:"access_token"`
 }
 
-func grabUserToken() (string, error) {
+func grabUserToken() (authToken string, characterId uint32, err error) {
 	listener, err := net.Listen("tcp", "localhost:13377")
 	if err != nil {
-		return "", fmt.Errorf("listening: %w", err)
+		return "", 0, fmt.Errorf("listening: %w", err)
 	}
 	defer listener.Close()
 
@@ -40,7 +40,7 @@ func grabUserToken() (string, error) {
 	var rng [len(state) + len(codeVerifier)]byte
 	_, err = io.ReadFull(crand.Reader, rng[:])
 	if err != nil {
-		return "", fmt.Errorf("getting randomness: %w", err)
+		return "", 0, fmt.Errorf("getting randomness: %w", err)
 	}
 
 	copy(state[:], rng[:len(state)])
@@ -107,21 +107,45 @@ func grabUserToken() (string, error) {
 
 	err = exec.Command("xdg-open", userUrl).Run()
 	if err != nil {
-		return "", fmt.Errorf("opening browser: %w", err)
+		return "", 0, fmt.Errorf("opening browser: %w", err)
 	}
 
-	auth := <-token
+	authToken = <-token
 	close(exitServer)
 
-	return auth, nil
+	jwtSections := strings.Split(authToken, ".")
+	if len(jwtSections) != 3 {
+		return "", 0, fmt.Errorf("invalid JWT")
+	}
+	payload, err := base64.RawStdEncoding.DecodeString(jwtSections[1])
+	if err != nil {
+		return "", 0, fmt.Errorf("decoding JWT payload: %w", err)
+	}
+
+	var jwt jwtJson
+	err = json.Unmarshal(payload, &jwt)
+	if err != nil {
+		return "", 0, fmt.Errorf("decoding JWT json: %w", err)
+	}
+	id := strings.TrimPrefix(jwt.Sub, "CHARACTER:EVE:")
+	if id == jwt.Sub {
+		return "", 0, fmt.Errorf("invalid JWT sub")
+	}
+
+	characterId64, err := strconv.ParseUint(id, 10, 32)
+	if err != nil {
+		return "", 0, fmt.Errorf("parsing character ID: %w", err)
+	}
+
+	return authToken, uint32(characterId64), nil
 }
 
 type locationJson struct {
 	SolarSystemID uint32 `json:"solar_system_id"`
 }
 
-func getLocation(auth, id string) (uint32, error) {
-	req, err := http.NewRequest(http.MethodGet, baseUrl+"/v2/characters/"+id+"/location/", nil)
+func getLocation(auth string, characterId uint32) (uint32, error) {
+	req, err := http.NewRequest(http.MethodGet, baseUrl+"/v2/characters/"+strconv.FormatUint(uint64(characterId), 10)+"/location/", nil)
 	if err != nil {
 		return 0, fmt.Errorf("creating request: %w", err)
 	}
@@ -150,55 +174,7 @@ type jwtJson struct {
 	Sub string `json:"sub"`
 }
 
-func addWaypoints(g graph, route []uint32, rotateBasedOnPosition bool) error {
-	token, err := grabUserToken()
-	if err != nil {
-		return fmt.Errorf("getting user token: %w", err)
-	}
-
-	jwtSections := strings.Split(token, ".")
-	if len(jwtSections) != 3 {
-		return fmt.Errorf("invalid JWT")
-	}
-	payload, err := base64.RawStdEncoding.DecodeString(jwtSections[1])
-	if err != nil {
-		return fmt.Errorf("decoding JWT payload: %w", err)
-	}
-
-	var jwt jwtJson
-	err = json.Unmarshal(payload, &jwt)
-	if err != nil {
-		return fmt.Errorf("decoding JWT json: %w", err)
-	}
-	id := strings.TrimPrefix(jwt.Sub, "CHARACTER:EVE:")
-	if id == jwt.Sub {
-		return fmt.Errorf("invalid JWT sub")
-	}
-	fmt.Println("Character ID:", id)
-
-	if rotateBasedOnPosition {
-		// grab the user's current location
-		startLocation, err := getLocation(token, id)
-		if err != nil {
-			return fmt.Errorf("getting location: %w", err)
-		}
-		locationIndex, ok := g.IdsToMatrixIndexes[startLocation]
-		if !ok {
-			return fmt.Errorf("location not in graph")
-		}
-
-		closestRouteIndex := 0
-		closestRouteLength := ^uint8(0)
-		for i, system := range route {
-			lengthToSystem := g.Matrix.At(locationIndex, g.IdsToMatrixIndexes[system])
-			if lengthToSystem < closestRouteLength {
-				closestRouteIndex = i
-				closestRouteLength = lengthToSystem
-			}
-		}
-		route = append(route[closestRouteIndex:], route[:closestRouteIndex]...)
-	}
-
+func addWaypoints(g graph, token string, route []uint32) error {
 	const minBackoff = time.Second
 	backoff := minBackoff
 	for i, system := range route {
