@@ -14,6 +14,7 @@ import (
 )
 
 const JitaID = 30000142
+const ZarzakhID = 30100000 // FIXME: maybe allow to ban pathfinding by argument instead ¿ would require fancier graph.json handling
 
 func markAllReachables(reachables map[uint32]struct{}, systems map[uint32]system, edges map[uint32][]uint32, node uint32, onlyHighsec bool) {
 	if onlyHighsec {
@@ -179,6 +180,10 @@ func fetchSystems(onlyHighsec bool) (nodes map[uint32]system, edges map[uint32][
 		failedSystems := systems[:0]
 		// Don't multithread this, the API reacts poorly to being spiked
 		for i, id := range systems {
+			if id == ZarzakhID {
+				continue // Zarzakh is not worth it, it require to wait 6 hours to go through an other stargates you entered from.
+			}
+
 			fmt.Printf("fetching system: %d/%d %.2f%%\n", i, len(systems), float64(i)/float64(len(systems))*100)
 
 			var s systemJson
